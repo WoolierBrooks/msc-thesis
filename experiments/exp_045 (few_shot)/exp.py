@@ -36,6 +36,16 @@ STATUS desta versão:
   otimização por n-shot ao estilo Seção 4.3 do paper foi descartada
   por decisão do usuário (FSPL é lento demais para valer o custo da
   busca de 60 variantes).
+- FORMATO DE SAÍDA: cada combinação (dataset, repetição, n-shot,
+  método) gera UMA SÓ LINHA com média, desvio-padrão, mediana e
+  contagem de batches do AE e do RAE calculados sobre os ~1008 batches
+  de teste. Reduz o CSV final para a ordem de ~100 mil linhas.
+- CHECKPOINT/RESUME (esta versão): ao iniciar, o script lê o CSV de
+  saída e pula todo par (dataset, repetição) que já tenha TODOS os
+  n-shots gravados. Pares parciais (crash no meio da escrita) são
+  removidos do CSV e refeitos do zero. Como split, scaler e rng de cada
+  repetição dependem só de rep_seed = SEED + rep, pular repetições não
+  altera os resultados das seguintes.
 """
 
 import os
@@ -710,6 +720,77 @@ def apply_smq(smq_state, Xte_batch):
 
 
 # ============================================================
+# AGREGAÇÃO DE RESULTADOS POR BATCH
+#
+# Em vez de gravar uma linha por batch de teste (o que gerava ~100
+# milhões de linhas no total do experimento e estourou a cota de
+# disco), acumulamos os valores de AE/RAE de cada método numa lista e,
+# ao final de cada (dataset, repetição, n-shot), resumimos cada método
+# numa única linha com média, desvio-padrão, mediana e contagem de
+# batches. Reduz o CSV final para a ordem de ~100 mil linhas.
+# ============================================================
+
+def summarize_method_results(ae_list, rae_list):
+    ae_arr = np.asarray(ae_list, dtype=float)
+    rae_arr = np.asarray(rae_list, dtype=float)
+    return dict(
+        ae_mean=ae_arr.mean(),
+        ae_std=ae_arr.std(),
+        ae_median=np.median(ae_arr),
+        rae_mean=rae_arr.mean(),
+        rae_std=rae_arr.std(),
+        rae_median=np.median(rae_arr),
+        n_batches=len(ae_arr),
+    )
+
+
+# ============================================================
+# CHECKPOINT / RESUME
+# ============================================================
+
+def load_completed_reps():
+    """Lê o CSV de saída e devolve o conjunto de (dataset, repeticao) já
+    completos, isto é, que têm TODOS os n-shots de N_SHOTS presentes.
+    Grupos parciais (crash no meio da escrita) são removidos do CSV
+    para serem refeitos do zero, evitando linhas duplicadas."""
+    if not os.path.exists(OUTPUT_CSV) or os.path.getsize(OUTPUT_CSV) == 0:
+        return set()
+
+    try:
+        df = pd.read_csv(OUTPUT_CSV, dtype={"dataset": str, "n": str},
+                         on_bad_lines="skip")
+    except Exception as e:
+        print(f"⚠️  Não consegui ler {OUTPUT_CSV} para resume ({e}). "
+              f"Começando do zero sem apagar o arquivo.")
+        return set()
+
+    if df.empty:
+        return set()
+
+    expected_n = {str(n) for n in N_SHOTS}
+    completed = set()
+    incomplete_keys = set()
+
+    for (ds, rep), g in df.groupby(["dataset", "repeticao"]):
+        if expected_n.issubset(set(g["n"].astype(str))):
+            completed.add((ds, int(rep)))
+        else:
+            incomplete_keys.add((ds, int(rep)))
+
+    # Remove grupos parciais do CSV (reescrita atômica)
+    if incomplete_keys:
+        keys = list(zip(df["dataset"], df["repeticao"].astype(int)))
+        mask_keep = np.array([k not in incomplete_keys for k in keys])
+        tmp_path = OUTPUT_CSV + ".tmp"
+        df[mask_keep].to_csv(tmp_path, index=False)
+        os.replace(tmp_path, OUTPUT_CSV)
+        print(f"🧹 Removidos {int((~mask_keep).sum())} linhas de "
+              f"{len(incomplete_keys)} (dataset, rep) incompletos.")
+
+    return completed
+
+
+# ============================================================
 # LOOP PRINCIPAL
 # ============================================================
 
@@ -718,7 +799,14 @@ def run_one_dataset_one_rep_one_nshot(ds_name, Xtr_full, ytr_full, Xte, yte,
     rng = np.random.default_rng(rep_seed)
     Xtr, ytr = sample_few_shot(Xtr_full, ytr_full, n_per_class, rng)
 
-    rows = []
+    # nome do método -> {"ae": [...], "rae": [...]} acumulado ao longo
+    # de todos os batches de teste dessa combinação (dataset, rep, n).
+    per_method = {}
+
+    def add_result(name, ae_val, rae_val):
+        entry = per_method.setdefault(name, {"ae": [], "rae": []})
+        entry["ae"].append(ae_val)
+        entry["rae"].append(rae_val)
 
     # ---- 7 baselines ----
     for name in BASELINE_CLASSES:
@@ -729,23 +817,19 @@ def run_one_dataset_one_rep_one_nshot(ds_name, Xtr_full, ytr_full, Xte, yte,
             Xte, yte, 2, N_TEST_BATCHES, BATCH_SIZE, rng
         ):
             p_hat = model.quantify(Xte[idx_batch])
-            rows.append(dict(dataset=ds_name, n=n_per_class, metodo=name,
-                              ae=ae(p_hat, p_real),
-                              rae=rae(p_hat, p_real, len(ytr))))
+            add_result(name, ae(p_hat, p_real), rae(p_hat, p_real, len(ytr)))
 
     # ---- FSNN ----
     fsnn = FSNN().fit(Xtr, ytr)
     for idx_batch, p_real in artificial_prevalence_batches(Xte, yte, 2, N_TEST_BATCHES, BATCH_SIZE, rng):
         p_hat = fsnn.quantify(Xte[idx_batch])
-        rows.append(dict(dataset=ds_name, n=n_per_class, metodo="FSNN",
-                          ae=ae(p_hat, p_real), rae=rae(p_hat, p_real, len(ytr))))
+        add_result("FSNN", ae(p_hat, p_real), rae(p_hat, p_real, len(ytr)))
 
     # ---- FSMM ----
     fsmm = FSMM(gamma=0.2).fit(Xtr, ytr)
     for idx_batch, p_real in artificial_prevalence_batches(Xte, yte, 2, N_TEST_BATCHES, BATCH_SIZE, rng):
         p_hat = fsmm.quantify(Xte[idx_batch])
-        rows.append(dict(dataset=ds_name, n=n_per_class, metodo="FSMM",
-                          ae=ae(p_hat, p_real), rae=rae(p_hat, p_real, len(ytr))))
+        add_result("FSMM", ae(p_hat, p_real), rae(p_hat, p_real, len(ytr)))
 
     # ---- FSGMM / FSGPEM / FSPL: transdutivos por definição no paper
     # (re-treinam por amostra de teste), então entram direto no loop
@@ -757,16 +841,13 @@ def run_one_dataset_one_rep_one_nshot(ds_name, Xtr_full, ytr_full, Xte, yte,
         Xte_b = Xte[idx_batch]
 
         p_hat = fsgmm.fit_quantify(Xtr, ytr, Xte_b)
-        rows.append(dict(dataset=ds_name, n=n_per_class, metodo="FSGMM",
-                          ae=ae(p_hat, p_real), rae=rae(p_hat, p_real, len(ytr))))
+        add_result("FSGMM", ae(p_hat, p_real), rae(p_hat, p_real, len(ytr)))
 
         p_hat = fsgpem.fit_quantify(Xtr, ytr, Xte_b)
-        rows.append(dict(dataset=ds_name, n=n_per_class, metodo="FSGPEM",
-                          ae=ae(p_hat, p_real), rae=rae(p_hat, p_real, len(ytr))))
+        add_result("FSGPEM", ae(p_hat, p_real), rae(p_hat, p_real, len(ytr)))
 
         p_hat = fspl.fit_quantify(Xtr, ytr, Xte_b, n_per_class)
-        rows.append(dict(dataset=ds_name, n=n_per_class, metodo="FSPL",
-                          ae=ae(p_hat, p_real), rae=rae(p_hat, p_real, len(ytr))))
+        add_result("FSPL", ae(p_hat, p_real), rae(p_hat, p_real, len(ytr)))
 
     # ---- SMQ (base + rf + et + gbr + iso) — treina UMA VEZ, aplica em
     # todos os batches (bug corrigido) ----
@@ -775,8 +856,13 @@ def run_one_dataset_one_rep_one_nshot(ds_name, Xtr_full, ytr_full, Xte, yte,
         for idx_batch, p_real in artificial_prevalence_batches(Xte, yte, 2, N_TEST_BATCHES, BATCH_SIZE, rng):
             smq_results = apply_smq(smq_state, Xte[idx_batch])
             for name, p_hat in smq_results.items():
-                rows.append(dict(dataset=ds_name, n=n_per_class, metodo=name,
-                                  ae=ae(p_hat, p_real), rae=rae(p_hat, p_real, len(ytr))))
+                add_result(name, ae(p_hat, p_real), rae(p_hat, p_real, len(ytr)))
+
+    # ---- resume cada método numa única linha ----
+    rows = []
+    for name, vals in per_method.items():
+        summary = summarize_method_results(vals["ae"], vals["rae"])
+        rows.append(dict(dataset=ds_name, n=n_per_class, metodo=name, **summary))
 
     return rows
 
@@ -790,10 +876,22 @@ def run_experiment():
     print(f"N-shots: {N_SHOTS}")
     print(f"SMQ habilitado: {moss_base_model is not None}")
 
-    header_written = os.path.exists(OUTPUT_CSV)
+    completed = load_completed_reps()
+    total = len(datasets) * N_REPETITIONS
+    print(f"♻️  Resume: {len(completed)}/{total} (dataset, repetição) já concluídos")
+
+    header_written = os.path.exists(OUTPUT_CSV) and os.path.getsize(OUTPUT_CSV) > 0
 
     for ds_name in datasets:
-        print(f"\n📂 Dataset: {ds_name}")
+        pending_reps = [r for r in range(N_REPETITIONS)
+                        if (ds_name, r + 1) not in completed]
+
+        if not pending_reps:
+            print(f"\n⏭️  Dataset {ds_name}: todas as {N_REPETITIONS} repetições já feitas, pulando")
+            continue
+
+        print(f"\n📂 Dataset: {ds_name} "
+              f"({len(pending_reps)} repetições pendentes de {N_REPETITIONS})")
         try:
             dataset = qp.datasets.fetch_UCIBinaryDataset(ds_name, verbose=False)
         except Exception as e:
@@ -804,7 +902,7 @@ def run_experiment():
         X_all = np.vstack([train.instances, test.instances])
         y_all = np.concatenate([train.labels, test.labels])
 
-        for rep in range(N_REPETITIONS):
+        for rep in pending_reps:
             rep_seed = SEED + rep
             Xtr_full, Xte, ytr_full, yte = train_test_split(
                 X_all, y_all, test_size=0.3, random_state=rep_seed, stratify=y_all
@@ -827,7 +925,8 @@ def run_experiment():
                 OUTPUT_CSV, mode="a", header=not header_written, index=False
             )
             header_written = True
-            print(f"   ✅ rep {rep + 1}/{N_REPETITIONS} salva ({len(all_rows)} linhas)")
+            completed.add((ds_name, rep + 1))
+            print(f"   ✅ rep {rep + 1}/{N_REPETITIONS} salva ({len(all_rows)} linhas resumidas)")
             gc.collect()
 
 
