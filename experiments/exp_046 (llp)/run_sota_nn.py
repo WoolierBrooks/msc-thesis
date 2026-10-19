@@ -536,9 +536,15 @@ def _load_dataset(ds):
     return _DATA[ds]
 
 
-def _init_worker(device):
+def _init_worker(device, gpu_slots=None, n_gpu=0):
+    """Com --gpu-workers, os n_gpu primeiros workers usam cuda e o resto, cpu."""
     global DEVICE
     DEVICE = device
+    if gpu_slots is not None:
+        with gpu_slots.get_lock():
+            idx = gpu_slots.value
+            gpu_slots.value += 1
+        DEVICE = "cuda" if idx < n_gpu else "cpu"
     torch.set_num_threads(1)
 
 
@@ -665,6 +671,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--device", default="cpu", help="cpu ou cuda")
+    ap.add_argument("--gpu-workers", type=int, default=0,
+                    help="quantos dos --workers rodam em cuda (o resto em cpu); ignora --device")
     ap.add_argument("--datasets", nargs="*", default=None, help="subconjunto de datasets")
     ap.add_argument("--reps", type=int, default=None, help="só as N primeiras repetições")
     args = ap.parse_args()
@@ -712,8 +720,14 @@ def main():
     print(f"Saída: {os.path.abspath(OUT_CSV)}")
 
     t_start, n_done = time.time(), 0
+    if args.gpu_workers:
+        import multiprocessing as mp
+        initargs = (args.device, mp.Value("i", 0), args.gpu_workers)
+        print(f"Workers: {args.gpu_workers} em cuda + {args.workers - args.gpu_workers} em cpu")
+    else:
+        initargs = (args.device,)
     with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker,
-                             initargs=(args.device,)) as pool:
+                             initargs=initargs) as pool:
         futs = {pool.submit(run_rep, d, rp - 1, base_cfg.get((d, rp), {}), base_cc.get((d, rp))): (d, rp)
                 for d, rp in pend}
         for fut in as_completed(futs):
